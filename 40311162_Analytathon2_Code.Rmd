@@ -1,0 +1,394 @@
+---
+title: "R Notebook"
+output:
+  pdf_document: default
+  html_notebook: default
+  author: Yogesh Bore
+---
+For source code refer this Rmd file
+For Report please refer 40311162_Analytathon2_Report_RMD file
+I have used same plots from this source code which are given in the folder ALL_Plots
+
+```{r}
+# Load all the required Libraries
+library(skimr)
+library(tidyverse)
+library(caret)
+library(mice)
+library(NbClust)
+library(ggplot2)
+library(readxl)
+library(dplyr)
+library(tidyr)
+library(ggcorrplot)
+library(caretEnsemble)
+library(ranger)
+library(gridExtra)
+library(corrplot)
+library(data.table)
+library(klaR)
+library(NbClust)
+library(FactoMineR)
+library(factoextra)
+library(mgcv)
+library(tidyquant)
+library(corrplot)
+```
+
+
+
+```{r}
+#Read the given object distance csv file and load data into dataframe
+Obj_dis_data <- read.csv("object_distances.csv")
+#head(Obj_dis_data)
+
+Obj_dis_data$generated_uid <- 1:nrow(Obj_dis_data)
+
+```
+
+
+```{r}
+
+all.files <- list.files(path = "./data/",pattern = ".txt")
+
+setwd("./data/")
+
+## fread function is used to read the data
+read_data <- function(fn){
+name<-gsub(".txt","",fn)
+#print(name)
+uuid <- substr(name, start = 1, stop = 19)
+temp_var <- fread(fn, select = c("###MJD","uJy","duJy","F","chi/N"))
+temp_var <- temp_var %>% dplyr::rename("MJD" ="###MJD")
+temp_var <- temp_var %>% dplyr::rename("chibyn" = "chi/N")
+temp_var$uuid <- uuid
+return(temp_var)
+}
+# then using
+data_list <- lapply(all.files, read_data)
+my_data <- do.call('rbind',data_list)
+
+#head(my_data)
+my_data$uuid <- as.numeric(my_data$uuid)
+write.csv(my_data,"test.csv")
+#length(my_data$uuid)
+
+
+```
+
+
+```{r}
+# Remove the na values from the data
+complete_data <- na.omit(my_data)
+
+#length(complete_data$uuid)
+
+# Filter the data for orange and cyan filter
+complete_data <- complete_data %>% filter(F !='t') %>% filter(chibyn >=0)
+
+```
+
+#EDA
+
+```{r}
+#Convert the given data into data frame
+EDA_data <- complete_data
+
+#Print first 21 rows
+#head(EDA_data)
+
+#Check the data types of all variables
+str(EDA_data)
+
+#Convert the data type character target variable to numerical
+#EDA_data$uuid <- as.numeric(EDA_data$uuid)
+
+#Gives Na's and max and min values and basic idea of spread of variables
+#Check the spread of each variable
+summary(complete_data)
+
+
+one_star <- EDA_data %>% filter(uuid==1000350600112828900)
+
+#Plot the box plot for the data
+boxplot_uJy <- ggplot(one_star, aes(uJy))+geom_boxplot()
+
+#ggsave(boxplot_ujy, file="UJY.png", width = 10)
+
+boxplot_uJy
+
+#Plot the box plot for the data
+boxplot_duJy <- ggplot(one_star, aes(duJy))+geom_boxplot()
+
+#ggsave(boxplot_dujy, file="DUJY.png", width = 10)
+
+boxplot_duJy
+
+#boxplot(one_star$uJy, one_star$duJy, one_star$chibyN, names=c("uJy","duJy","Chi/n"))
+
+# Correlation plot before modelling
+Corr_data1 <- EDA_data[,c("MJD","uJy","duJy","chibyn")]
+
+#Find the correlation of all variables from the data set except date
+correlations <- cor(Corr_data1)
+corrplot(correlations, method="number", outline = TRUE, tl.col = "black")
+
+#Print the correlation chart for all 4 variables which displayed histogram scatter plot in same correlation matrix
+chart.Correlation(Corr_data1, histogram=TRUE, pch=19)
+summary(EDA_data)
+
+```
+
+
+```{r}
+#Apply left join to merge object distance and all light curve data using uuid
+complete_data <- complete_data %>% left_join(Obj_dis_data, by = "uuid")
+
+# Calculate luminosity using given formula and add column to the data
+complete_data <- complete_data %>% mutate(lum = 4 * 3.14 *((distance_mpc)^2) * uJy )
+
+# Normalize the luminosity using min max method and add new column lum_norm 
+complete_data <- complete_data %>% group_by(uuid,F) %>% mutate(lum_norm = (lum - min(lum))/(max(lum)-min(lum)))
+
+# Group the light curve data using the uuid and color and took 2 standard deviation above and below data for ujy (Brightness)
+complete_data <- complete_data %>% group_by(uuid,F) %>% subset( complete_data$uJy< median(complete_data$uJy) + 2 * sd(complete_data$uJy)  & complete_data$uJy > (median(complete_data$uJy)- 2 * sd(complete_data$uJy))) 
+
+# Group the light curve data using the uuid and color and took 1 standard deviation above and below data for duJy (error)
+complete_data <- complete_data %>% group_by(uuid,F) %>% subset( complete_data$duJy< median(complete_data$duJy) + 1 * sd(complete_data$duJy)  & complete_data$duJy > (median(complete_data$duJy)- 1 * sd(complete_data$duJy)))
+
+# Calculate the medain for ujy and add new column for that
+complete_data_summary <- complete_data %>% group_by(uuid,F) %>% dplyr::summarize(med_uJy = median(uJy),max_uJy = max(uJy))
+
+#head(complete_data_summary)
+
+#complete_data <- complete_data %>% left_join(complete_data_summary, by = c("uuid","F"))
+complete_data <- complete_data %>% left_join(complete_data_summary, by = c("uuid","F"))
+
+
+#Filtered out values outside of 1 std deviations of median flux error
+complete_data_neg_adj <- complete_data %>% group_by(uuid,F) %>% mutate(adj_uJy = ifelse(med_uJy < 0, uJy+abs(med_uJy),uJy))
+
+#Adjusted the baseline for negative values using rolling median for 15 days
+complete_data_roll_med <- complete_data_neg_adj %>% group_by(uuid,F) %>% dplyr::mutate(roll_uJy = rollmedian(x = adj_uJy, k = 15, fill = NA)) 
+
+#Remove the na values from the data
+complete_data_roll_med <- na.omit(complete_data_roll_med)
+
+#filter on the rolling median to retain the data points greater than 60 microJanskys
+complete_data_roll_med_filtered <- complete_data_roll_med %>%  subset(roll_uJy > 60)
+
+
+```
+
+
+
+
+```{r echo=TRUE}
+# Filter the adjusted data for light curve :1000350600112828900
+neg_set_data <- complete_data_neg_adj %>% filter(uuid == 1000350600112828900)
+final_set_data <- complete_data_roll_med %>% filter(uuid == 1000350600112828900)
+k_set_data <- complete_data_roll_med_filtered %>% filter(uuid == 1000350600112828900)
+    
+
+# Plot the graph for orange and cyan filter  with error bar to check the points
+plot_one <- ggplot(neg_set_data, aes(x=MJD, y=uJy, color=F)) +
+  geom_point()+
+  geom_errorbar(aes(ymin=(uJy-0.5*duJy), ymax=(uJy+0.5*duJy)), width=0.2) + facet_grid(~F,scales="free")+ scale_color_manual(values=c("o"="orange", "c"="cyan"))
+plot_one
+
+#  Plot the graph for negative values using rolling median for 15 days
+plot_two <- ggplot(final_set_data, aes(x=MJD, y=roll_uJy, color=F)) +
+  geom_point() +
+  geom_errorbar(aes(ymin=(roll_uJy-0.5*duJy), ymax=(roll_uJy+0.5*duJy)), width=1) + facet_grid(~F,scales="free") + scale_color_manual(values=c("o"="orange", "c"="cyan"))
+plot_two
+
+#  Plot the graph for data points greater than 60 microJanskys
+plot_three <- ggplot(k_set_data, aes(x=MJD, y=roll_uJy, color=F)) +
+  geom_point()+
+  geom_hline(yintercept= 50) + facet_grid(~F,scales="free") + scale_color_manual(values=c("o"="orange", "c"="cyan"))
+plot_three
+
+```
+
+
+```{r}
+#Find the correlation of all 4 variables again after data cleaning 
+corr_set <- k_set_data %>% dplyr::select("MJD","uJy","duJy","chibyn") 
+
+corr_set<- corr_set[,-(1)]
+corr_set<- corr_set[,-(1)]
+#If you get error for numeric please run the line 216 again
+correlations <- cor(corr_set)
+corrplot(correlations, method="number", outline = TRUE, tl.col = "black")
+#head(corr_set)
+
+```
+
+
+```{r}
+#GAM analysis before  selection of the rolling median filter selection
+before <- complete_data_roll_med %>% filter(uuid == 1000350600112828900)
+after <- complete_data_roll_med_filtered %>% filter(uuid == 1000350600112828900)
+mod1 <- gam(uJy ~ s(MJD), data=before, method = "REML")
+summary(mod1)
+
+#GAM analysis after selection of the rolling median filter selection
+mod2 <- gam(uJy ~ s(MJD), data=after, method = "REML")
+summary(mod2)
+```
+
+
+
+
+
+```{r}
+# Clustering 
+#Separate the data based on the filter as they may give different number of clusters
+complete_data_orng <- complete_data_roll_med_filtered %>% filter(F =='o')
+complete_data_cyan <- complete_data_roll_med_filtered %>% filter(F =='c')
+
+
+#Filter orange data for rolling uJy
+mean_analysis_o <- complete_data_orng %>%
+        group_by(uuid,generated_uid) %>%
+        dplyr::summarise(peak_height = max(roll_uJy),
+                  totaltime = max(MJD)-min(MJD))
+
+#Filter orange data for luminocity
+lum_analysis_o <- complete_data_orng %>%
+        group_by(uuid,generated_uid) %>%
+        dplyr::summarise(peak_lum = max(lum),
+                  totaltime = max(MJD)-min(MJD))
+
+
+#Filter cyan data for rolling uJy
+mean_analysis_cyan <- complete_data_cyan %>%
+        group_by(uuid,generated_uid) %>%
+        dplyr::summarise(peak_height = max(roll_uJy),
+                  totaltime = max(MJD)-min(MJD))
+
+#Filter cyan data for Lum
+lum_analysis_cyan <- complete_data_cyan %>%
+        group_by(uuid,generated_uid) %>%
+        dplyr::summarise(peak_lum = max(lum),
+                  totaltime = max(MJD)-min(MJD))
+
+set.seed(123)
+#head(mean_analysis_o)
+#head(complete_data_cyan)
+
+```
+
+
+
+```{r}
+# Automatically detect optimal number of clusters using NbClust method
+# NbClust package provides 30 indices for determining the number of clusters 
+# and proposes to user the best clustering scheme from the different results obtained by 
+# varying all combinations of number of clusters, distance measures, and clustering methods.
+
+ds_clust_input_o <- mean_analysis_o[,2:4]
+res_kmeans_automatic <- ds_clust_input_o %>% 
+  NbClust(distance = "euclidean",
+          min.nc = 2, max.nc = 15, 
+          method = "kmeans", index ="all") 
+
+# Visualize 
+fviz_nbclust(res_kmeans_automatic, ggtheme = theme_minimal())
+
+
+fviz_nbclust(ds_clust_input_o, kmeans, method = "wss")
+
+
+```
+
+
+```{r}
+# Having in mind that it is almost tied, let's compare a quality of clustering for both k=2 and k=3
+res_kmeans_2 <- kmeans(ds_clust_input_o, centers = 2, nstart = 25)
+res_kmeans_3 <- kmeans(ds_clust_input_o, centers = 3, nstart = 25)
+res_kmeans_4 <- kmeans(ds_clust_input_o, centers = 4, nstart = 25)
+
+
+res_kmeans_2$centers
+
+# Centers of 3 clusters
+res_kmeans_3$centers
+
+# Centers of 5 clusters
+res_kmeans_4$centers
+
+# Append cluster IDs to the ds_clust_o dataset
+mean_analysis_o <- mean_analysis_o %>% 
+  as.data.frame() %>% 
+  mutate(
+    cluster_id_2 = res_kmeans_2$cluster,
+    cluster_id_3 = res_kmeans_3$cluster,
+    cluster_id_4 = res_kmeans_4$cluster
+  )
+
+#mean_analysis_o
+
+# Inspect the quality of clustering 
+#table(mean_analysis_o$cluster_id_2)
+#table(mean_analysis_o$cluster_id_3)
+#table(mean_analysis_o$cluster_id_4)
+
+```
+
+
+
+
+```{r}
+#Sampling of some light curves from the clusters to generate graphs for cluster 1
+ds_clust1_full <- complete_data_roll_med %>% filter(generated_uid == 195)
+ds_clust1_filtered <- complete_data_roll_med_filtered %>% filter(generated_uid == 195)
+
+#Sampling of some light curves from the clusters to generate graphs for cluster 2
+ds_clust2_full <- complete_data_roll_med %>% filter(generated_uid == 8)
+ds_clust2_filtered <- complete_data_roll_med_filtered %>% filter(generated_uid == 8)
+
+#Sampling of some light curves from the clusters to generate graphs for cluster 3
+ds_clust3_full <- complete_data_roll_med %>% filter(generated_uid == 12)
+ds_clust3_filtered <- complete_data_roll_med_filtered %>% filter(generated_uid == 12)
+
+#Sampling of some light curves from the clusters to generate graphs for cluster 4
+ds_clust4_full <- complete_data_roll_med %>% filter(generated_uid == 150)
+ds_clust4_filtered <- complete_data_roll_med_filtered %>% filter(generated_uid == 150)
+
+ggplot(ds_clust1_full, aes(x = MJD, y = roll_uJy, color=F)) +
+         geom_point() +
+         geom_errorbar(aes(ymin=(roll_uJy-0.5*duJy), ymax=(roll_uJy+0.5*duJy)), width=1)+ facet_grid(~F,scales="free") + scale_color_manual(values=c("o"="orange", "c"="cyan"))
+
+ggplot(ds_clust1_filtered, aes(x = MJD, y = roll_uJy, color=F)) +
+         geom_point() +
+         geom_errorbar(aes(ymin=(roll_uJy-0.5*duJy), ymax=(roll_uJy+0.5*duJy)), width=1)+ facet_grid(~F,scales="free") + scale_color_manual(values=c("o"="orange", "c"="cyan"))
+
+ggplot(ds_clust2_full, aes(x = MJD, y = roll_uJy, color=F)) +
+         geom_point() +
+         geom_errorbar(aes(ymin=(roll_uJy-0.5*duJy), ymax=(roll_uJy+0.5*duJy)), width=1)+ facet_grid(~F,scales="free") + scale_color_manual(values=c("o"="orange", "c"="cyan"))
+
+ggplot(ds_clust2_filtered, aes(x = MJD, y = roll_uJy, color=F)) +
+         geom_point() +
+         geom_errorbar(aes(ymin=(roll_uJy-0.5*duJy), ymax=(roll_uJy+0.5*duJy)), width=1)+ facet_grid(~F,scales="free") + scale_color_manual(values=c("o"="orange", "c"="cyan"))
+
+ggplot(ds_clust3_full, aes(x = MJD, y = roll_uJy, color=F)) +
+         geom_point() +
+         geom_errorbar(aes(ymin=(roll_uJy-0.5*duJy), ymax=(roll_uJy+0.5*duJy)), width=1)+ facet_grid(~F,scales="free") + scale_color_manual(values=c("o"="orange", "c"="cyan"))
+
+ggplot(ds_clust3_filtered, aes(x = MJD, y = roll_uJy, color=F)) +
+         geom_point() +
+         geom_errorbar(aes(ymin=(roll_uJy-0.5*duJy), ymax=(roll_uJy+0.5*duJy)), width=1)+ facet_grid(~F,scales="free") + scale_color_manual(values=c("o"="orange", "c"="cyan"))
+
+
+ggplot(ds_clust4_full, aes(x = MJD, y = roll_uJy, color=F)) +
+         geom_point() +
+         geom_errorbar(aes(ymin=(roll_uJy-0.5*duJy), ymax=(roll_uJy+0.5*duJy)), width=1)+ facet_grid(~F,scales="free") + scale_color_manual(values=c("o"="orange", "c"="cyan"))
+
+ggplot(ds_clust4_filtered, aes(x = MJD, y = roll_uJy, color=F)) +
+         geom_point() +
+         geom_errorbar(aes(ymin=(roll_uJy-0.5*duJy), ymax=(roll_uJy+0.5*duJy)), width=1)+ facet_grid(~F,scales="free") + scale_color_manual(values=c("o"="orange", "c"="cyan"))
+
+```
+
+
